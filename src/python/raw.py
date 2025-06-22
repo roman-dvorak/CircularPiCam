@@ -42,7 +42,9 @@ def create_output_directory(base_dir):
     output_dir = os.path.join(base_dir, f"{year}/{month:02}/{day:02}")
     os.makedirs(output_dir, exist_ok=True)
 
-    output_subdir = os.path.join(output_dir, f"rawcap_{int(time.time())}")
+    # Použití ISO datetime v UTC místo Unix timestamp
+    iso_datetime = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+    output_subdir = os.path.join(output_dir, f"rawcap_{iso_datetime}")
     os.makedirs(output_subdir, exist_ok=True)
 
     print(f"📂 Data budou ukládána do: {output_subdir}")
@@ -212,7 +214,6 @@ async def websocket_client():
 
 
 def main():
-    current_date = None
     last_snapshot_time = 0
     snapshot_interval = 30  # Interval v sekundách
 
@@ -221,13 +222,6 @@ def main():
 
     while True:
         try:
-            # Dynamické vytvoření složky
-            current_time = time.localtime()
-            year, month, day = current_time.tm_year, current_time.tm_mon, current_time.tm_mday
-            if current_date != (year, month, day):
-                current_date = (year, month, day)
-                OUTPUT_DIR = create_output_directory(base_dir)
-
             print(f"🔁 Bufferuje posledních {PRE_SECONDS + POST_SECONDS}s RAW dat ({RES}, {FPS} FPS)...")
             buffer.clear()
             timestamps.clear()
@@ -245,6 +239,9 @@ def main():
                     save_snapshot(frame.copy(), base_dir, timestamp)
                     last_snapshot_time = timestamp
 
+            # Vytvoření nové složky pro každý trigger
+            OUTPUT_DIR = create_output_directory(base_dir)
+            
             print(f"📸 TRIGGER! Nahrávám ještě {POST_SECONDS}s...")
             trigger_time = time.time()
             for _ in range(FPS * POST_SECONDS):
@@ -273,8 +270,8 @@ if __name__ == "__main__":
             "FrameDurationLimits": (int(1e6 // FPS), int(1e6 // FPS)),
             "FrameRate": 60,
             "AwbEnable": False,
-            "AeEnable": True,
-            #"AnalogueGain": 1.0,
+            "AeEnable": False,
+            "AnalogueGain": 5.0,
             #"DigitalGain": 2.0,   
         }
     )

@@ -5,18 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	_ "golang.org/x/image/tiff"
-
 	"github.com/fogleman/gg"
+	"gocv.io/x/gocv"
 )
 
 type MetaInfo struct {
@@ -36,44 +33,6 @@ func extractMetadata(desc string) (*MetaInfo, error) {
 	return &meta, err
 }
 
-func demosaicBGGR(gray *image.Gray) *image.RGBA {
-	bounds := gray.Bounds()
-	rgba := image.NewRGBA(bounds)
-	for y := 0; y < bounds.Dy()-1; y++ {
-		for x := 0; x < bounds.Dx()-1; x++ {
-			var r, g, b uint8
-			p := gray.GrayAt(x, y).Y
-			if y%2 == 0 {
-				if x%2 == 0 {
-					// B
-					b = p
-					g = (gray.GrayAt(x+1, y).Y + gray.GrayAt(x, y+1).Y) / 2
-					r = gray.GrayAt(x+1, y+1).Y
-				} else {
-					// G (on blue row)
-					g = p
-					b = (gray.GrayAt(x-1, y).Y + gray.GrayAt(x+1, y).Y) / 2
-					r = (gray.GrayAt(x, y+1).Y + gray.GrayAt(x+1, y+1).Y) / 2
-				}
-			} else {
-				if x%2 == 0 {
-					// G (on red row)
-					g = p
-					b = (gray.GrayAt(x, y-1).Y + gray.GrayAt(x+1, y-1).Y) / 2
-					r = (gray.GrayAt(x-1, y).Y + gray.GrayAt(x+1, y).Y) / 2
-				} else {
-					// R
-					r = p
-					g = (gray.GrayAt(x-1, y).Y + gray.GrayAt(x, y-1).Y) / 2
-					b = gray.GrayAt(x-1, y-1).Y
-				}
-			}
-			rgba.Set(x, y, color.RGBA{r, g, b, 255})
-		}
-	}
-	return rgba
-}
-
 func drawOverlay(img image.Image, meta *MetaInfo, index int, total int) image.Image {
 	dc := gg.NewContextForImage(img)
 	dc.SetRGBA(0, 0, 0, 0.7)
@@ -87,7 +46,7 @@ func drawOverlay(img image.Image, meta *MetaInfo, index int, total int) image.Im
 	return dc.Image()
 }
 
-func processTIFFs(inputDir string, outputDir string) error {
+func processTIFFs(inputDir string, outputFile string) error {
 	files, err := filepath.Glob(filepath.Join(inputDir, "*.tiff"))
 	if err != nil {
 		return err
@@ -95,27 +54,32 @@ func processTIFFs(inputDir string, outputDir string) error {
 	sort.Strings(files)
 	total := len(files)
 
-	err = os.MkdirAll(outputDir, 0755)
-	if err != nil {
-		return err
+	// Get first image to determine video dimensions
+	firstImg := gocv.IMRead(files[0], gocv.IMReadGrayScale)
+	if firstImg.Empty() {
+		return fmt.Errorf("Failed to read first image for dimensions")
 	}
+	width := firstImg.Cols()
+	height := firstImg.Rows()
+	firstImg.Close()
+
+	// Create VideoWriter
+	writer, err := gocv.VideoWriterFile(outputFile, "avc1", 30.0, width, height, true)
+	if err != nil {
+		return fmt.Errorf("Error creating video writer: %v", err)
+	}
+	defer writer.Close()
 
 	for i, file := range files {
-		f, err := os.Open(file)
-		if err != nil {
-			return err
-		}
-		img, format, err := image.Decode(f)
-		f.Close()
-		if err != nil {
-			return err
-		}
-		if format != "tiff" {
+		// Load image with GoCV
+		img := gocv.IMRead(file, gocv.IMReadGrayScale)
+		if img.Empty() {
+			log.Printf("Failed to read image: %s", file)
 			continue
 		}
 
-		// získej metadata (ImageDescription)
-		f, _ = os.Open(file)
+		// Extract metadata
+		f, _ := os.Open(file)
 		buf := new(bytes.Buffer)
 		buf.ReadFrom(f)
 		f.Close()
@@ -133,40 +97,42 @@ func processTIFFs(inputDir string, outputDir string) error {
 			continue
 		}
 
-		// Bayer demosaic
-		grayImg, ok := img.(*image.Gray)
-		if !ok {
-			log.Printf("Image is not grayscale: %s", file)
+		// Debayer using OpenCV
+		colorImg := gocv.NewMat()
+		gocv.CvtColor(img, &colorImg, gocv.ColorBayerBG2RGB)
+
+		// Convert to Go image for overlay
+		goImg, _ := colorImg.ToImage()
+		finalImg := drawOverlay(goImg, meta, i+1, total)
+
+		// Convert back to Mat for video writing
+		buf = new(bytes.Buffer)
+		jpeg.Encode(buf, finalImg, nil)
+		data := buf.Bytes()
+		mat, err := gocv.IMDecode(data, gocv.IMReadColor)
+		if err != nil {
+			log.Printf("Error decoding image: %v", err)
 			continue
 		}
-		colorImg := demosaicBGGR(grayImg)
-		finalImg := drawOverlay(colorImg, meta, i+1, total)
 
-		outfile := filepath.Join(outputDir, fmt.Sprintf("frame_%04d.jpg", i+1))
-		outf, err := os.Create(outfile)
-		if err != nil {
-			return err
-		}
-		err = jpeg.Encode(outf, finalImg, &jpeg.Options{Quality: 95})
-		outf.Close()
-		if err != nil {
-			return err
-		}
-		log.Printf("Wrote %s", outfile)
+		// Write frame to video
+		writer.Write(mat)
+		log.Printf("Processed frame %d/%d", i+1, total)
+
+		// Free resources
+		img.Close()
+		colorImg.Close()
+		mat.Close()
 	}
 
-	// vytvoř MP4 pomocí ffmpeg
-	cmd := exec.Command("ffmpeg", "-y", "-framerate", "30", "-i", filepath.Join(outputDir, "frame_%04d.jpg"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "output.mp4")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return nil
 }
 
 func main() {
-	inputDir := "./"       // aktuální složka
-	outputDir := "preview" // náhledy
+	inputDir := "./"           // aktuální složka
+	outputFile := "output.mp4" // výstupní video
 
-	err := processTIFFs(inputDir, outputDir)
+	err := processTIFFs(inputDir, outputFile)
 	if err != nil {
 		log.Fatal(err)
 	}
