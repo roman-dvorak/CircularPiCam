@@ -1,0 +1,13 @@
+[Unit]
+Description=Circular Pi Camera Capture
+After=network.target
+
+[Service]
+User=mill
+WorkingDirectory=/home/mill/repos/CircularPiCam/src/python
+ExecStart=/bin/bash -c 'source /home/mill/repos/CircularPiCam/src/python/venv/bin/activate && exec python3 raw.py'
+Restart=on-failure
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
