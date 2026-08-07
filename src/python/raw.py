@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import argparse
 from collections import deque
 import csv
 import shutil
@@ -16,10 +17,8 @@ import tifffile
 
 
 # Nastavení pro ukládání jako 8bitové TIFF obrázky
-save_as_8bit = True
+save_as_8bit = False
 base_dir = "/mnt/ramdisk/CAM/frames"
-
-
 
 # Nastavení kamery
 RES = (1456, 1088)
@@ -28,8 +27,13 @@ PRE_SECONDS = 2
 POST_SECONDS = 2
 BUFFER_FRAMES = FPS * (PRE_SECONDS + POST_SECONDS)
 
-# WebSocket server settings
+# WebSocket trigger
+WEBSOCKET_ENABLED = False
 WEBSOCKET_SERVER_URL = "ws://mill.lan:8080/trigger"
+
+# Synchronizace na vzdálený server (rsync)
+SYNC_ENABLED = False
+SYNC_DEST = "mill.lan:/storage/CAM/"
 
 
 def create_output_directory(base_dir):
@@ -169,15 +173,15 @@ def compress_directory(output_dir, remove_source=False):
 
 def sync_to_remote(source_dir):
     """Přesune data na vzdálený server pomocí rsync."""
-    remote_path = "mill.lan:/storage/CAM/"
+    if not SYNC_ENABLED:
+        return
     try:
-        print(f"🔄 Synchronizuji data z {source_dir} do: {remote_path}")
-        # Přidáme SSH options pro vynechání ověřování host key
+        print(f"🔄 Synchronizuji data z {source_dir} do: {SYNC_DEST}")
         subprocess.run([
             "rsync", "-avz", "--remove-source-files",
-            source_dir, remote_path
+            source_dir, SYNC_DEST
         ], check=True)
-        print(f"✅ Data byla úspěšně synchronizována do: {remote_path}")
+        print(f"✅ Data byla úspěšně synchronizována do: {SYNC_DEST}")
     except subprocess.CalledProcessError as e:
         print(f"❌ Chyba při synchronizaci dat: {e}")
 
@@ -196,9 +200,15 @@ async def websocket_client():
         print(f"🌐 Připojeno k WebSocket serveru na {WEBSOCKET_SERVER_URL}")
         while True:
             try:
-                message = await websocket.recv()
-                message = json.loads(message) if isinstance(message, str) else message
-                print(f"📡 Přijatá zpráva: {message}")
+                raw = await websocket.recv()
+                ts = time.strftime("%H:%M:%S", time.localtime())
+                print(f"[{ts}] 📡 WS raw: {raw}")
+                try:
+                    message = json.loads(raw) if isinstance(raw, str) else raw
+                except json.JSONDecodeError:
+                    print(f"[{ts}] ⚠️ Nepodařilo se parsovat JSON: {raw}")
+                    continue
+                print(f"[{ts}] 📡 Přijatá zpráva: {message}")
 
                 if message.get('type') == "TRIGG":
                     print("📡 WebSocket TRIGGER received!")
@@ -217,12 +227,16 @@ def main():
     last_snapshot_time = 0
     snapshot_interval = 30  # Interval v sekundách
 
-    # Spuštění WebSocket klienta v samostatném vlákně
-    threading.Thread(target=lambda: asyncio.run(websocket_client()), daemon=True).start()
+    # Spuštění WebSocket klienta v samostatném vlákně (pokud je povoleno)
+    if WEBSOCKET_ENABLED:
+        threading.Thread(target=lambda: asyncio.run(websocket_client()), daemon=True).start()
+        print(f"🌐 WebSocket trigger: {WEBSOCKET_SERVER_URL}")
+    else:
+        print("🌐 WebSocket trigger: vypnutý")
 
     while True:
         try:
-            print(f"🔁 Bufferuje posledních {PRE_SECONDS + POST_SECONDS}s RAW dat ({RES}, {FPS} FPS)...")
+            print(f"🔁 Bufferuje posledních {PRE_SECONDS + POST_SECONDS}s RAW dat ({RES}, {FPS} FPS)... [stiskni Enter pro trigger]")
             buffer.clear()
             timestamps.clear()
             triggered.clear()
@@ -252,8 +266,16 @@ def main():
 
             save_metadata_csv(OUTPUT_DIR, buffer, timestamps, trigger_time)
             save_frames(OUTPUT_DIR, buffer, timestamps, trigger_time, save_as_8bit)
+
+            if len(timestamps) > 1:
+                span_s = timestamps[-1] - timestamps[0]
+                measured_fps = (len(timestamps) - 1) / span_s if span_s > 0 else 0.0
+                print(f"📈 Naměřený FPS: {measured_fps:.2f} (cíl: {FPS} FPS)")
+
             # compress_directory(OUTPUT_DIR, remove_source=True)
             sync_to_remote(base_dir)
+            print(f"\n🎬 Záznam dokončen — {len(buffer)} snímků uloženo do: {OUTPUT_DIR}")
+            print("⏳ Připraveno na další trigger...\n")
 
         except KeyboardInterrupt:
             print("⛔ Přerušeno uživatelem.")
@@ -261,19 +283,52 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CircularPiCam — kruhový RAW buffer s triggerem")
+    parser.add_argument("--websocket", action="store_true", default=WEBSOCKET_ENABLED,
+                        help="Zapnout WebSocket trigger")
+    parser.add_argument("--no-websocket", dest="websocket", action="store_false",
+                        help="Vypnout WebSocket trigger")
+    parser.add_argument("--websocket-url", default=WEBSOCKET_SERVER_URL, metavar="URL",
+                        help=f"URL WebSocket serveru (výchozí: {WEBSOCKET_SERVER_URL})")
+    parser.add_argument("--sync", action="store_true", default=SYNC_ENABLED,
+                        help="Zapnout rsync synchronizaci po triggeru")
+    parser.add_argument("--no-sync", dest="sync", action="store_false",
+                        help="Vypnout rsync synchronizaci")
+    parser.add_argument("--sync-dest", default=SYNC_DEST, metavar="DEST",
+                        help=f"Cíl rsync synchronizace (výchozí: {SYNC_DEST})")
+    args = parser.parse_args()
+
+    # Přepis globální konfigurace podle argumentů
+    WEBSOCKET_ENABLED = args.websocket
+    WEBSOCKET_SERVER_URL = args.websocket_url
+    SYNC_ENABLED = args.sync
+    SYNC_DEST = args.sync_dest
+
     # Inicializace kamery
     picam2 = Picamera2()
+
+    # Detekce mono vs. barevný senzor
+    is_mono = "AwbEnable" not in picam2.camera_controls
+    print(f"📷 Senzor: {'mono' if is_mono else 'barevný (AWB dostupné)'}")
+
+    FRAME_US = int(1e6 // FPS)
+
+    cam_controls = {
+        "FrameDurationLimits": (FRAME_US, FRAME_US),
+        "FrameRate": 60,
+        "AeEnable": True,
+        "ExposureValue": 0,
+        #"AeExposureMode": controls.AeExposureModeEnum.Long,
+        #"AnalogueGain": 1.0,
+        #"DigitalGain": 2.0,
+    }
+    if not is_mono:
+        cam_controls["AwbEnable"] = False
+
     config = picam2.create_video_configuration(
-        raw={"size": RES, "format": "SRGGB10"},
+        raw={"size": RES, "format": "R10"},
         encode=None,
-        controls={
-            "FrameDurationLimits": (int(1e6 // FPS), int(1e6 // FPS)),
-            "FrameRate": 60,
-            "AwbEnable": False,
-            "AeEnable": False,
-            "AnalogueGain": 5.0,
-            #"DigitalGain": 2.0,   
-        }
+        controls=cam_controls,
     )
     picam2.configure(config)
     picam2.start()

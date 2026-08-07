@@ -3,9 +3,9 @@ Description=Circular Pi Camera Capture
 After=network.target
 
 [Service]
-User=mill
-WorkingDirectory=/home/mill/repos/CircularPiCam/src/python
-ExecStart=/bin/bash -c 'source /home/mill/repos/CircularPiCam/src/python/venv/bin/activate && exec python3 raw.py'
+User=astrometers
+WorkingDirectory=/home/astrometers/repos/CircularPiCam/src/python
+ExecStart=/bin/bash -c 'source /home/astrometers/repos/CircularPiCam/src/python/venv/bin/activate && exec python3 raw.py --websocket --sync --sync-dest mill@mill.lan:/storage/CAM/ --websocket-url ws://mill.lan:8080/trigger'
 Restart=on-failure
 Environment=PYTHONUNBUFFERED=1
 

@@ -1,0 +1,4 @@
+# Pip-installovatelné závislosti (picamera2 se instaluje přes apt)
+tifffile>=2025.0.0
+websockets>=15.0.0
+numpy>=1.24.0
