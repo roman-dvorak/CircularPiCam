@@ -1,165 +1,99 @@
 # CircularPiCam
 
-Systém kruhového bufferu pro Raspberry Pi kameru (IMX296 Global Shutter) s ukládáním RAW snímků před a po triggeru.
+Circular-buffer RAW capture for the Raspberry Pi camera (developed for the IMX296
+global-shutter sensor, mono or color). The camera continuously records into an
+in-memory ring buffer; when a trigger fires, the frames from **before and after**
+the event are saved as TIFF images with per-frame metadata and optionally synced
+to a remote server.
 
-## Přehled komponent
+Everything lives in a single script: [`src/python/raw.py`](src/python/raw.py).
 
-```
-src/
-├── python/
-│   ├── raw.py          # Hlavní capture démon (Python/picamera2) — produkční
-│   └── circ.py         # Experiment s H.264 kruhovým bufferem (nevyužito v produkci)
-├── SimpleCapture/
-│   ├── main.cpp        # C++ přepis capture démona (libcamera) — výkonnější varianta
-│   └── config.ini      # Konfigurace pro main.cpp
-├── go/
-│   └── process_capture/
-│       └── process_capture.go  # Post-processing: TIFF → MP4 s overlayem
-└── systemd/
-    └── circular-picam.service  # Systemd unit pro automatický start
-```
+> Older experiments (C++ libcamera daemon, H.264 buffer `circ.py`, Go TIFF→MP4
+> post-processing) are kept in the [`archive`](../../tree/archive) branch.
 
-Binárka `build/simple_capture` je předkompilovaný C++ démon pro aarch64.
+## How it works
 
-## Jak to funguje
+1. The camera runs at **1456×1088, 60 FPS**, 10-bit RAW (`R10`), auto-exposure
+   enabled. Mono vs. color sensor is detected automatically (AWB is disabled on
+   color sensors).
+2. Frames are kept in a ring buffer covering `PRE_SECONDS + POST_SECONDS`
+   (default 2 s + 2 s = 240 frames).
+3. When a trigger fires, another `POST_SECONDS` of frames are captured and the
+   whole buffer is written to a new directory:
 
-1. Kamera snímá RAW snímky (1456×1088, 60 FPS) do kruhového bufferu v RAM.
-2. Po triggeru (Enter, WebSocket, GPIO, nebo detekce jasu) se uloží N sekund před + po triggeru jako TIFF soubory na RAMFS.
-3. Data se synchronizují na vzdálený server přes `rsync`.
+   ```
+   /mnt/ramdisk/CAM/frames/YYYY/MM/DD/rawcap_YYYY-MM-DDTHH-MM-SSZ/
+       frame_0000.tiff
+       frame_0001.tiff
+       ...
+       metadata.csv
+   ```
 
-## Nastavení Python prostředí
+   Each TIFF (16-bit by default) carries metadata in its header: timestamp,
+   frame number, time relative to the trigger, min/max/mean/median pixel value.
+   The same values are written to `metadata.csv`. The measured FPS is printed
+   after each capture.
+4. If sync is enabled, data are moved to the remote server with
+   `rsync --remove-source-files`.
+5. Independently of triggers, a **snapshot** frame is saved every 30 s to
+   `/mnt/ramdisk/CAM/snapshots/YYYY/MM/DD/snapshot_<unix_ts>.tiff`.
 
-### 1. Systémové závislosti (jednou)
+## Triggers
+
+| Trigger | Default | Description |
+|---|---|---|
+| Keyboard | on | Press **Enter** in the terminal. |
+| Light (intensity) | on | Fires when the mean pixel value of a frame exceeds the moving-average baseline of the previous frames by a given ratio (meteor, flash, other sudden brightening). |
+| WebSocket | off | Message `{"type": "TRIGG"}` from the WebSocket server. |
+
+The WebSocket server can also send `{"type": "COMPRESS_AND_SYNC"}`, which zips the
+last capture directory, removes the source and syncs it.
+
+## Command-line options
+
+| Option | Default | Description |
+|---|---|---|
+| `--light-trigger` / `--no-light-trigger` | enabled | Enable/disable the light-intensity trigger. |
+| `--light-threshold RATIO` | `1.3` | Fire when frame mean > baseline × `RATIO` (1.3 = 30 % increase). |
+| `--light-baseline-frames N` | `30` | Number of previous frames averaged for the baseline (30 = 0.5 s at 60 FPS). |
+| `--websocket` / `--no-websocket` | disabled | Enable/disable the WebSocket trigger. |
+| `--websocket-url URL` | `ws://mill.lan:8080/trigger` | WebSocket server URL. |
+| `--sync` / `--no-sync` | disabled | rsync data to the remote server after each trigger. |
+| `--sync-dest DEST` | `mill.lan:/storage/CAM/` | rsync destination. |
+
+Examples:
 
 ```bash
-sudo apt install python3-picamera2 python3-venv
+python3 raw.py                          # keyboard + light trigger, no sync
+python3 raw.py --no-light-trigger       # keyboard only
+python3 raw.py --light-threshold 1.5 --light-baseline-frames 60
+python3 raw.py --websocket --sync --sync-dest user@server:/storage/CAM/
 ```
 
-### 2. Vytvoření virtualenv
+Other settings (`RES`, `FPS`, `PRE_SECONDS`, `POST_SECONDS`, `save_as_8bit`,
+`base_dir`, camera controls) are constants at the top of `raw.py`.
+
+## Installation
+
+### 1. System dependencies
+
+```bash
+sudo apt install python3-picamera2 python3-venv rsync zip
+```
+
+### 2. Virtualenv
 
 ```bash
 python3 -m venv --system-site-packages src/python/venv
-```
-
-> `--system-site-packages` je nutné — picamera2 se instaluje přes apt a není dostupná přes pip.
-
-### 3. Instalace pip závislostí
-
-```bash
 src/python/venv/bin/pip install -r requirements-pip.txt
 ```
 
-### 4. Spuštění
+> `--system-site-packages` is required — picamera2 is installed via apt and is
+> not available from pip.
 
-```bash
-source src/python/venv/bin/activate
-python3 src/python/raw.py
-```
+### 3. Ramdisk
 
-Stiskni **Enter** pro manuální trigger. Nebo pošli WebSocket zprávu `{"type": "TRIGG"}` na `ws://mill.lan:8080/trigger`.
-
-## C++ varianta (main.cpp)
-
-Výkonnější varianta s GPIO triggerem, brightness triggerem (meteor/blesk), auto-gain a čtením konfigurace z `config.ini`.
-
-### Závislosti
-
-```bash
-sudo apt install build-essential cmake pkg-config libcamera-dev libtiff-dev libgpiod-dev
-```
-
-### Build
-
-Z kořene repozitáře:
-
-```bash
-cmake -B build .
-cmake --build build -j4
-```
-
-Výsledná binárka: `build/simple_capture`. Po úpravě `main.cpp` stačí znovu spustit
-`cmake --build build -j4` (re-konfigurace přes `cmake -B build .` je potřeba jen po změně
-`CMakeLists.txt`).
-
-### Spuštění
-
-```bash
-./build/simple_capture src/SimpleCapture/config.ini
-```
-
-Konfigurace se načítá z `src/SimpleCapture/config.ini` (nebo z `/etc/circularpicam.conf`).
-
-### CLI argumenty
-
-Stejně jako `raw.py`, i `simple_capture` umožňuje přepsat vybrané volby z `config.ini` argumenty
-příkazové řádky (cesta ke config.ini může být buď poziční argument, nebo `--config`):
-
-```bash
-./build/simple_capture --config src/SimpleCapture/config.ini \
-    --websocket --websocket-url ws://mill.lan:8080/trigger \
-    --sync --sync-dest mill.lan:/storage/CAM/
-```
-
-| Volba | Popis |
-|-------|-------|
-| `--config <cesta>` | Cesta ke konfiguračnímu souboru |
-| `--keyboard` / `--no-keyboard` | Trigger přes Enter |
-| `--gpio` / `--no-gpio` | GPIO trigger |
-| `--brightness` / `--no-brightness` | Brightness trigger |
-| `--websocket` / `--no-websocket` | WebSocket trigger |
-| `--websocket-url <URL>` | `ws://host:port/path` — rozloží se na host/port/path |
-| `--sync` / `--no-sync` | Rsync synchronizace po triggeru |
-| `--sync-dest <cíl>` | Cíl rsync synchronizace |
-| `--save-8bit` / `--no-save-8bit` | Ukládat TIFF jako 8bit místo 16bit |
-| `-h`, `--help` | Nápověda |
-
-Argumenty mají přednost před hodnotami v `config.ini`.
-
-## Systemd service
-
-Upravte `src/systemd/circular-picam.service` — změňte cesty k repozitáři a uživatele dle svého prostředí:
-
-```ini
-[Service]
-User=<your_user>
-WorkingDirectory=/path/to/CircularPiCam/src/python
-ExecStart=/bin/bash -c 'source /path/to/CircularPiCam/src/python/venv/bin/activate && exec python3 raw.py'
-```
-
-Instalace:
-
-```bash
-sudo cp src/systemd/circular-picam.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now circular-picam
-sudo systemctl status circular-picam
-```
-
-## Post-processing: TIFF → MP4
-
-`src/go/process_capture/process_capture.go` vezme složku s TIFF snímky a sestaví z nich MP4 video s overlayem (číslo snímku, relativní čas).
-
-### Závislosti
-
-```bash
-sudo apt install golang libopencv-dev
-go get gocv.io/x/gocv github.com/fogleman/gg
-```
-
-### Spuštění
-
-```bash
-cd src/go/process_capture
-go mod init process_capture
-go mod tidy
-go run process_capture.go
-```
-
-Výstup: `output.mp4` v aktuální složce.
-
-## RAMFS
-
-Data se ukládají na `/mnt/ramdisk`. Vytvoření:
+Data are written to `/mnt/ramdisk`:
 
 ```bash
 sudo mkdir -p /mnt/ramdisk
@@ -167,20 +101,23 @@ echo 'tmpfs /mnt/ramdisk tmpfs rw,size=4G 0 0' | sudo tee -a /etc/fstab
 sudo mount -a
 ```
 
-## Konfigurace (C++ varianta)
+### 4. Run
 
-Hlavní parametry v `src/SimpleCapture/config.ini`:
+```bash
+source src/python/venv/bin/activate
+python3 src/python/raw.py
+```
 
-| Klíč | Výchozí | Popis |
-|------|---------|-------|
-| `fps` | 60 | Počet snímků za sekundu |
-| `pre_seconds` | 2 | Sekund bufferu před triggerem |
-| `post_seconds` | 2 | Sekund záznamu po triggeru |
-| `resolution_width/height` | 1456×1088 | Rozlišení |
-| `analogue_gain` | 22.0 | Analogový zisk |
-| `save_as_8bit` | false | Ukládat TIFF jako 8bit (menší soubory) místo 16bit |
-| `trigger_keyboard` | true | Trigger přes Enter |
-| `trigger_gpio` | false | Trigger přes GPIO (pin 17) |
-| `trigger_brightness` | true | Trigger při náhlém nárůstu jasu |
-| `trigger_websocket` | false | Trigger přes WebSocket |
-| `sync_enabled` | true | Synchronizovat data přes rsync po triggeru |
+For `--sync`, the user needs SSH key access to the remote server.
+
+## Systemd service
+
+Edit [`src/systemd/circular-picam.service`](src/systemd/circular-picam.service)
+(user, repository path, options on the `ExecStart` line), then:
+
+```bash
+sudo cp src/systemd/circular-picam.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now circular-picam
+sudo systemctl status circular-picam
+```
